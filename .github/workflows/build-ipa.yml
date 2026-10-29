@@ -1,0 +1,250 @@
+name: Build iOS IPA (macOS Cloud Runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsp_url:
+        description: 'Direct download URL(s) for game .nsp/.nsz/.xci (space-separated for base + update/DLC, or Google Drive URL/ID). Leave blank to use NSP_URL secret or repo files.'
+        required: false
+        type: string
+      nsp_repo_path:
+        description: 'Folder path in the repo if NSPs are committed/LFS (ignored if URL is used)'
+        required: false
+        default: 'games'
+        type: string
+      romfs_mode:
+        description: 'RomFS packaging mode: bundle (single full IPA) or separate (small IPA + separate RomFS.img)'
+        required: false
+        default: 'bundle'
+        type: choice
+        options:
+          - bundle
+          - separate
+      language:
+        description: 'Game language code (e.g. en-US, ja, fr, de, es, zh-Hans, ko)'
+        required: false
+        default: 'en-US'
+        type: string
+      app_name:
+        description: 'Optional custom home-screen app name (defaults to game title from NSP)'
+        required: false
+        type: string
+      bundle_id:
+        description: 'Optional custom bundle ID (defaults to org.nxnative.<title_id>)'
+        required: false
+        type: string
+      runner_image:
+        description: 'GitHub macOS runner image (xcode-27 matches upstream Metal lock; macos-15 / macos-latest use --allow-other-metal fallback)'
+        required: false
+        default: 'xcode-27'
+        type: choice
+        options:
+          - xcode-27
+          - macos-latest
+          - macos-15
+      create_release:
+        description: 'Also upload the compiled IPA to a private/draft GitHub Release (recommended for IPAs > 2GB)'
+        required: false
+        default: false
+        type: boolean
+      extra_args:
+        description: 'Optional extra flags for scripts/build_ipa_from_nsp.py (e.g. --no-motion --allow-damaged --provisional)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-ipa:
+    name: Compile Switch NSP to iOS IPA
+    runs-on: ${{ inputs.runner_image || 'xcode-27' }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Configure Xcode & Metal Toolchain
+        id: xcode
+        run: |
+          if [ -d "/Applications/Xcode_27.1.app/Contents/Developer" ]; then
+            export DEVELOPER_DIR="/Applications/Xcode_27.1.app/Contents/Developer"
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+            echo "other_metal=false" >> "$GITHUB_OUTPUT"
+          else
+            LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+            if [ -n "$LATEST_XCODE" ]; then
+              export DEVELOPER_DIR="$LATEST_XCODE/Contents/Developer"
+              echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+            fi
+            echo "other_metal=true" >> "$GITHUB_OUTPUT"
+          fi
+          xcodebuild -version
+          if ! xcrun --sdk iphoneos --show-sdk-version >/dev/null 2>&1; then
+            echo "Installing iOS Platform SDK..."
+            xcodebuild -downloadPlatform iOS
+          fi
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Downloading Xcode MetalToolchain..."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk iphoneos metal --version
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml
+
+      - name: Set up .NET 10 SDK (for shader translator)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install Homebrew & Python dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install xcodegen zstd glslang aria2
+          python -m pip install --upgrade pip
+          python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic gdown
+
+      - name: Load prod.keys from GitHub Secret
+        env:
+          PROD_KEYS_SECRET: ${{ secrets.PROD_KEYS }}
+        run: |
+          if [ -z "$PROD_KEYS_SECRET" ]; then
+            echo "::error::Missing PROD_KEYS secret! Go to Settings -> Secrets and variables -> Actions and add PROD_KEYS (raw text or base64-encoded)."
+            exit 1
+          fi
+          KEYS_PATH="$RUNNER_TEMP/prod.keys"
+          if echo "$PROD_KEYS_SECRET" | grep -q "=" && echo "$PROD_KEYS_SECRET" | grep -qi "key"; then
+            printf "%s\n" "$PROD_KEYS_SECRET" > "$KEYS_PATH"
+          else
+            echo "$PROD_KEYS_SECRET" | tr -d '[:space:]' | base64 --decode > "$KEYS_PATH"
+          fi
+          echo "KEYS_PATH=$KEYS_PATH" >> "$GITHUB_ENV"
+          echo "Loaded prod.keys ($(wc -l < "$KEYS_PATH" | tr -d ' ') lines)"
+
+      - name: Prepare Game NSP/NSZ/XCI Files
+        env:
+          INPUT_URLS: ${{ inputs.nsp_url }}
+          SECRET_URLS: ${{ secrets.NSP_URL }}
+          REPO_PATH: ${{ inputs.nsp_repo_path }}
+        run: |
+          NSP_DIR="$RUNNER_TEMP/game_nsps"
+          mkdir -p "$NSP_DIR"
+          URLS="${INPUT_URLS:-$SECRET_URLS}"
+
+          if [ -n "$URLS" ]; then
+            echo "Downloading game file(s) into $NSP_DIR..."
+            for url in $URLS; do
+              if [[ "$url" == *"drive.google.com"* ]] || [[ "$url" =~ ^[a-zA-Z0-9_-]{25,}$ ]]; then
+                gdown --fuzzy "$url" -O "$NSP_DIR/"
+              else
+                aria2c -x 16 -s 16 -k 1M --file-allocation=none --content-disposition-default-utf8=true -d "$NSP_DIR" "$url"
+              fi
+            done
+          elif [ -d "$REPO_PATH" ] && [ -n "$(ls -A "$REPO_PATH" 2>/dev/null)" ]; then
+            echo "Copying game files from repository folder '$REPO_PATH'..."
+            cp -v "$REPO_PATH"/* "$NSP_DIR/"
+          else
+            echo "::error::No game files provided! Supply 'nsp_url' when dispatching the workflow, set the 'NSP_URL' secret, or commit files to '$REPO_PATH'."
+            exit 1
+          fi
+
+          echo "Files in $NSP_DIR:"
+          ls -lh "$NSP_DIR"
+          echo "NSP_DIR=$NSP_DIR" >> "$GITHUB_ENV"
+
+      - name: Compile iOS IPA with nxnative
+        env:
+          DM_TEST_NO_METAL4: 1
+          ROMFS_Mode: ${{ inputs.romfs_mode }}
+          GAME_LANG: ${{ inputs.language }}
+          CUSTOM_APP_NAME: ${{ inputs.app_name }}
+          CUSTOM_BUNDLE_ID: ${{ inputs.bundle_id }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+          OTHER_METAL: ${{ steps.xcode.outputs.other_metal }}
+        run: |
+          OUT_DIR="$RUNNER_TEMP/ipa_out"
+          mkdir -p "$OUT_DIR"
+          echo "OUT_DIR=$OUT_DIR" >> "$GITHUB_ENV"
+
+          ARGS=(
+            "$NSP_DIR"
+            -k "$KEYS_PATH"
+            --romfs "${ROMFS_Mode:-bundle}"
+            --progress lines
+            --no-heap-check
+          )
+
+          if [ "${ROMFS_Mode:-bundle}" = "bundle" ]; then
+            ARGS+=(--no-keep-extracted)
+          fi
+
+          if [ -n "$GAME_LANG" ]; then
+            ARGS+=(-l "$GAME_LANG")
+          fi
+
+          if [ -n "$CUSTOM_APP_NAME" ]; then
+            ARGS+=(--app-name "$CUSTOM_APP_NAME")
+          fi
+
+          if [ -n "$CUSTOM_BUNDLE_ID" ]; then
+            ARGS+=(--bundle-id "$CUSTOM_BUNDLE_ID")
+          fi
+
+          if [ "$OTHER_METAL" = "true" ]; then
+            ARGS+=(--allow-other-metal)
+          fi
+
+          if [ -n "$EXTRA_ARGS" ]; then
+            # shellcheck disable=SC2206
+            EXTRA_ARR=($EXTRA_ARGS)
+            ARGS+=("${EXTRA_ARR[@]}")
+          fi
+
+          echo "Running: python3 scripts/build_ipa_from_nsp.py ${ARGS[*]}"
+          python3 scripts/build_ipa_from_nsp.py "${ARGS[@]}"
+
+          mv "$NSP_DIR"/*.ipa "$OUT_DIR/"
+          if [ "${ROMFS_Mode}" = "separate" ]; then
+            find "$NSP_DIR" -name "RomFS.img" -exec cp -v {} "$OUT_DIR/" \;
+          fi
+          ls -lh "$OUT_DIR"
+
+      - name: Upload Compiled IPA as Workflow Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-ios-ipa-${{ github.run_number }}
+          path: ${{ env.OUT_DIR }}/*
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish Draft GitHub Release (Optional)
+        if: ${{ inputs.create_release == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ipa-build-${{ github.run_number }}"
+          gh release create "$TAG" "$OUT_DIR"/* \
+            --title "nxnative IPA Build #${{ github.run_number }}" \
+            --notes "Automated macOS cloud runner build from workflow run #${{ github.run_number }}." \
+            --draft
+
+      - name: Upload Build Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-build-logs-${{ github.run_number }}
+          path: ${{ env.NSP_DIR }}/*_build/logs/*
+          retention-days: 7
