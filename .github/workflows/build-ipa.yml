@@ -7,8 +7,12 @@ on:
         description: 'Direct download URL(s) for game .nsp/.nsz/.xci (space-separated for base + update/DLC, or Google Drive URL/ID). Leave blank to use NSP_URL secret or repo files.'
         required: false
         type: string
+      title_id:
+        description: 'Optional 16-digit hex Title ID (e.g. 010015100B514000). Auto-detected from ticket, filename, or game title if left blank.'
+        required: false
+        type: string
       nsp_repo_path:
-        description: 'Folder path in the repo if NSPs are committed/LFS (ignored if URL is used)'
+        description: 'Folder path in the repo if NSPs/XCIs are committed/LFS (ignored if URL is used)'
         required: false
         default: 'games'
         type: string
@@ -26,7 +30,7 @@ on:
         default: 'en-US'
         type: string
       app_name:
-        description: 'Optional custom home-screen app name (defaults to game title from NSP)'
+        description: 'Optional custom home-screen app name (defaults to game title from NSP/XCI)'
         required: false
         type: string
       bundle_id:
@@ -82,7 +86,7 @@ jobs:
             LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
             if [ -n "$LATEST_XCODE" ]; then
               export DEVELOPER_DIR="$LATEST_XCODE/Contents/Developer"
-              echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+              echo "DEVELOPER_DIR=$LATEST_XCODE" >> "$GITHUB_ENV"
             fi
             echo "other_metal=true" >> "$GITHUB_OUTPUT"
           fi
@@ -139,6 +143,7 @@ jobs:
           INPUT_URLS: ${{ inputs.nsp_url }}
           SECRET_URLS: ${{ secrets.NSP_URL }}
           REPO_PATH: ${{ inputs.nsp_repo_path }}
+          MANUAL_TITLE_ID: ${{ inputs.title_id }}
         run: |
           NSP_DIR="$RUNNER_TEMP/game_nsps"
           mkdir -p "$NSP_DIR"
@@ -160,6 +165,64 @@ jobs:
             echo "::error::No game files provided! Supply 'nsp_url' when dispatching the workflow, set the 'NSP_URL' secret, or commit files to '$REPO_PATH'."
             exit 1
           fi
+
+          # Auto-tag XCI or ticketless NSP files that lack a [16-hex-digit Title ID] in their filename
+          python3 - "$NSP_DIR" "$MANUAL_TITLE_ID" << 'EOF'
+          import os, re, struct, sys
+          from pathlib import Path
+
+          nsp_dir = Path(sys.argv[1])
+          manual_tid = re.sub(r'[^0-9A-Fa-f]', '', sys.argv[2] or '').upper()
+          sys.path.insert(0, 'dm/games')
+          import game as gamemod
+
+          def has_tik(path):
+              try:
+                  with open(path, 'rb') as f:
+                      h = f.read(16)
+                      if h[:4] != b'PFS0': return False
+                      n, st = struct.unpack_from('<II', h, 4)
+                      ent, strs = f.read(n * 0x18), f.read(st)
+                  names = [strs[o:strs.index(b'\0', o)].decode(errors='replace') for o in (struct.unpack_from('<I', ent, i * 0x18 + 0x10)[0] for i in range(n))]
+                  return any(re.match(r'[0-9A-Fa-f]{32}\.tik$', name) for name in names)
+              except Exception:
+                  return False
+
+          def norm(s):
+              return re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
+
+          games = [(g.id.upper(), g.get('name', ''), norm(g.get('name', ''))) for g in gamemod.all_games()]
+
+          for p in sorted(nsp_dir.iterdir()):
+              if p.suffix.lower() not in ('.nsp', '.xci', '.nsz', '.xcz'):
+                  continue
+              if re.search(r'\[([0-9A-Fa-f]{16})\]', p.name) or has_tik(p):
+                  print(f"File '{p.name}' already has a readable Title ID.")
+                  continue
+
+              tid = manual_tid if len(manual_tid) == 16 else None
+              if not tid:
+                  clean_stem = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', p.stem)
+                  n_stem = norm(clean_stem)
+                  best_len = 0
+                  for gid, gname, gn in games:
+                      if gn and (gn in n_stem or n_stem in gn) and len(gn) > best_len:
+                          tid, best_len = gid, len(gn)
+                      else:
+                          gw = [w for w in gn.split() if len(w) > 1]
+                          sw = set(n_stem.split())
+                          if gw and all(w in sw for w in gw) and len(gn) > best_len:
+                              tid, best_len = gid, len(gn)
+
+              if tid:
+                  ver_tag = "" if re.search(r'\[v\d+\]', p.name) else "[v0]"
+                  new_name = f"{p.stem} [{tid}]{ver_tag}{p.suffix}"
+                  new_path = p.with_name(new_name)
+                  p.rename(new_path)
+                  print(f"Auto-tagged '{p.name}' -> '{new_name}' (Title ID: {tid})")
+              else:
+                  print(f"WARNING: Could not auto-detect Title ID for '{p.name}'. Rename the file to include [<16-digit-TitleID>] or pass title_id in workflow inputs.")
+          EOF
 
           echo "Files in $NSP_DIR:"
           ls -lh "$NSP_DIR"
