@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       nsp_url:
-        description: 'Direct download URL(s) for game .nsp/.nsz/.xci (space-separated for base + update/DLC, or Google Drive URL/ID). Leave blank to use NSP_URL secret or repo files.'
+        description: 'Direct download URL(s) for game .nup (Switch 2 / decrypted) or .nsp/.nsz/.xci/.xcz (space-separated for base + update/DLC, or Google Drive URL/ID). Leave blank to use NSP_URL secret or repo files.'
         required: false
         type: string
       title_id:
@@ -86,7 +86,7 @@ jobs:
             LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
             if [ -n "$LATEST_XCODE" ]; then
               export DEVELOPER_DIR="$LATEST_XCODE/Contents/Developer"
-              echo "DEVELOPER_DIR=$LATEST_XCODE" >> "$GITHUB_ENV"
+              echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
             fi
             echo "other_metal=true" >> "$GITHUB_OUTPUT"
           fi
@@ -126,19 +126,20 @@ jobs:
           PROD_KEYS_SECRET: ${{ secrets.PROD_KEYS }}
         run: |
           if [ -z "$PROD_KEYS_SECRET" ]; then
-            echo "::error::Missing PROD_KEYS secret! Go to Settings -> Secrets and variables -> Actions and add PROD_KEYS (raw text or base64-encoded)."
-            exit 1
-          fi
-          KEYS_PATH="$RUNNER_TEMP/prod.keys"
-          if echo "$PROD_KEYS_SECRET" | grep -q "=" && echo "$PROD_KEYS_SECRET" | grep -qi "key"; then
-            printf "%s\n" "$PROD_KEYS_SECRET" > "$KEYS_PATH"
+            echo "Notice: PROD_KEYS secret is empty (not needed for .nup containers; required for .nsp/.nsz/.xci/.xcz)."
+            echo "KEYS_PATH=" >> "$GITHUB_ENV"
           else
-            echo "$PROD_KEYS_SECRET" | tr -d '[:space:]' | base64 --decode > "$KEYS_PATH"
+            KEYS_PATH="$RUNNER_TEMP/prod.keys"
+            if echo "$PROD_KEYS_SECRET" | grep -q "=" && echo "$PROD_KEYS_SECRET" | grep -qi "key"; then
+              printf "%s\n" "$PROD_KEYS_SECRET" > "$KEYS_PATH"
+            else
+              echo "$PROD_KEYS_SECRET" | tr -d '[:space:]' | base64 --decode > "$KEYS_PATH"
+            fi
+            echo "KEYS_PATH=$KEYS_PATH" >> "$GITHUB_ENV"
+            echo "Loaded prod.keys ($(wc -l < "$KEYS_PATH" | tr -d ' ') lines)"
           fi
-          echo "KEYS_PATH=$KEYS_PATH" >> "$GITHUB_ENV"
-          echo "Loaded prod.keys ($(wc -l < "$KEYS_PATH" | tr -d ' ') lines)"
 
-      - name: Prepare Game NSP/NSZ/XCI Files
+      - name: Prepare Game NUP/NSP/NSZ/XCI Files
         env:
           INPUT_URLS: ${{ inputs.nsp_url }}
           SECRET_URLS: ${{ secrets.NSP_URL }}
@@ -194,6 +195,21 @@ jobs:
           games = [(g.id.upper(), g.get('name', ''), norm(g.get('name', ''))) for g in gamemod.all_games()]
 
           for p in sorted(nsp_dir.iterdir()):
+              if not p.is_file():
+                  continue
+              try:
+                  with open(p, 'rb') as mf:
+                      magic4 = mf.read(4)
+                  if magic4[:3] == b'NUP' and p.suffix.lower() != '.nup':
+                      np = p.with_name(p.name + '.nup')
+                      p.rename(np)
+                      print(f"Detected NUP magic on '{p.name}' -> renamed to '{np.name}'")
+                      p = np
+              except Exception:
+                  pass
+              if p.suffix.lower() == '.nup':
+                  print(f"NUP container ready: '{p.name}' (Title ID and packages are read from its header; no prod.keys required).")
+                  continue
               if p.suffix.lower() not in ('.nsp', '.xci', '.nsz', '.xcz'):
                   continue
               if re.search(r'\[([0-9A-Fa-f]{16})\]', p.name) or has_tik(p):
@@ -235,6 +251,7 @@ jobs:
           GAME_LANG: ${{ inputs.language }}
           CUSTOM_APP_NAME: ${{ inputs.app_name }}
           CUSTOM_BUNDLE_ID: ${{ inputs.bundle_id }}
+          MANUAL_TITLE_ID: ${{ inputs.title_id }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
           OTHER_METAL: ${{ steps.xcode.outputs.other_metal }}
         run: |
@@ -244,11 +261,18 @@ jobs:
 
           ARGS=(
             "$NSP_DIR"
-            -k "$KEYS_PATH"
             --romfs "${ROMFS_Mode:-bundle}"
             --progress lines
             --no-heap-check
           )
+
+          if [ -n "$KEYS_PATH" ] && [ -f "$KEYS_PATH" ]; then
+            ARGS+=(-k "$KEYS_PATH")
+          fi
+
+          if [ -n "$MANUAL_TITLE_ID" ]; then
+            ARGS+=(--title-id "$MANUAL_TITLE_ID")
+          fi
 
           if [ "${ROMFS_Mode:-bundle}" = "bundle" ]; then
             ARGS+=(--no-keep-extracted)
@@ -298,10 +322,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          REL_DIR="$RUNNER_TEMP/release_assets"
+          mkdir -p "$REL_DIR"
+          for f in "$OUT_DIR"/*; do
+            [ -f "$f" ] || continue
+            sz=$(stat -f%z "$f")
+            if [ "$sz" -ge 2000000000 ]; then
+              echo "Splitting $(basename "$f") ($sz bytes >= 2 GiB GitHub Release limit) into 1900 MB parts..."
+              split -b 1900m "$f" "$REL_DIR/$(basename "$f").part."
+            else
+              cp -v "$f" "$REL_DIR/"
+            fi
+          done
           TAG="ipa-build-${{ github.run_number }}"
-          gh release create "$TAG" "$OUT_DIR"/* \
+          gh release create "$TAG" "$REL_DIR"/* \
             --title "nxnative IPA Build #${{ github.run_number }}" \
-            --notes "Automated macOS cloud runner build from workflow run #${{ github.run_number }}." \
+            --notes "Automated macOS cloud runner build from workflow run #${{ github.run_number }}. (If split into .part.aa/.ab, reassemble with: cat *.part.* > game.ipa)" \
             --draft
 
       - name: Upload Build Logs on Failure

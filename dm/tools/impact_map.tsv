@@ -22,13 +22,18 @@ dm/games/*/bench.tsv	-	a benchmark route
 dm/games/*/usage.tsv	-	a usage manifest
 dm/games/*	profile	one game's profile
 scripts/build_ipa_from_nsp.py	*:*	packing: every game's build
+scripts/pack_nup.py	*:*	NUP packing: games built from NUP containers
 scripts/bench.py	-	the benchmark
 scripts/push_romfs.sh	*:*	RomFS transfer: every game's iOS build
 scripts/regress.py	-	the regression harness
 dm/tools/usage.py	-	the usage manifests
+dm/tools/il2cpp_sym.py	-	read-only IL2CPP address analysis; not part of a game build or the host
 dm/tools/impact_map.tsv	-	this map
 dm/tools/lint_python_baseline.tsv	-	the lint baseline
+dm/gfx/hle_nv.c	hle:_ZN2nv*	graphics-library lifecycle and memory-query exports
 dm/gfx/nvn/*	api:nvn	NVN on Metal: every NVN game
+dm/gfx/msl/*	*:*	the host's own Metal shaders (clears, copies, the present, the GPU deswizzle, the OpenGL clear quad): every game
+dm/gfx/tools/host_msl.py	*:*	builds the host's own Metal shaders into the host: every game
 dm/gfx/nvn/dmsh_chain.h	shader:stage:*	the chain version: every game's NVN shader libraries
 dm/gfx/nvn/dmsh_abi.h	shader:stage:*	the shader library ABI (driver segment layout, binding kinds): every game's NVN shader libraries and their replay
 dm/gfx/nvn/nvn_mtl.m:atomic|imga	shader:image_atomic*	image atomics on Metal
@@ -36,6 +41,8 @@ dm/gfx/nvn/nvn_mtl.m:warm_|prepare|prebuild|front_progress	present:pipeline_prep
 dm/gfx/nvn/nvn_mtl.m:pso_arch|arch_|pso_bundle	present:pipeline_archive	the pipeline archive
 dm/gfx/nvn/nvn_mtl.m:^tf_|xfb	shader:transform_feedback	transform feedback
 dm/gfx/nvn/nvn_mtl.m:^geo_|^gs_	shader:stage:gs	geometry shaders
+dm/gfx/nvn/nvn_mtl.m:^lo_|^lop_	nvn:nvnColorStateSetLogicOp	logic operations
+dm/gfx/nvn/nvn_mtl.m:prog_swrites|swrite_note	nvn:nvnCommandBufferBarrier	ordering barriers and shader writes in a draw pass
 dm/gfx/nvn/nvn_mtl.m:^at_|^atest_	nvn:nvnColorStateSetAlphaTest	the alpha test
 dm/gfx/nvn/nvn_mtl.m:pull_|hybrid	shader:pulling_vertex_inputs	pulling vertex inputs and the hybrid pipelines
 dm/gfx/nvn/nvn_mtl.m:fb_snap|fetch	shader:readable_tile	readable tiles and feedback snapshots
@@ -46,13 +53,14 @@ dm/gfx/tex/*	api:*	texture layouts: every game
 dm/gfx/vk/*	api:vulkan	Vulkan on Metal
 dm/gfx/gl/*	api:gl	OpenGL on Metal
 dm/gfx/tools/dmsh_atomic.py	shader:image_atomic*	image atomics in the MSL
+dm/gfx/tools/dmsh_wide.py	shader:stage:*	storage buffer reads in the MSL: every NVN game
 dm/gfx/tools/dmsh_build.py:vs_tf|tf_layout	shader:transform_feedback	transform feedback capture
 dm/gfx/tools/dmsh_build.py:gs_slice|geometry_finish|vs_layer|_ep_drop	shader:stage:gs	geometry shaders
 dm/gfx/tools/dmsh_build.py:vs_layer|vs_layer_entry	shader:layer_output	layer output
 dm/gfx/tools/dmsh_build.py:fs_uint	shader:integer_outputs	integer fragment outputs
 dm/gfx/tools/dmsh_build.py:int_inputs|vin_finish	shader:integer_vertex_inputs	integer vertex inputs
 dm/gfx/tools/dmsh_build.py:pull_finish	shader:pulling_vertex_inputs	pulling vertex inputs
-dm/gfx/tools/dmsh_build.py:fetch_finish|bf_	shader:readable_tile	readable tiles
+dm/gfx/tools/dmsh_build.py:ps_libraries	shader:readable_tile	readable tiles (cut from the pixel shader's one compile)
 dm/gfx/tools/dmsh_build.py:vs_pad	shader:vs_pad	padded vertex outputs
 dm/gfx/tools/dmsh_build.py:drv_reads|unfillable|DRV_FILL	shader:driver_read_*	driver constant segments
 dm/gfx/tools/dmsh_build.py:spv_single_lane|SG_	shader:simd	subgroup operations
@@ -62,7 +70,9 @@ dm/gfx/tools/dmsh_build.py	shader:stage:*	the shader build: every NVN game
 dm/gfx/tools/dmsh_vin.py	shader:integer_vertex_inputs	integer vertex inputs
 dm/gfx/tools/dmsh_pull.*	shader:pulling_vertex_inputs	pulling vertex inputs
 dm/gfx/tools/dmsh_fetch.py	shader:readable_tile	readable tiles
-dm/gfx/tools/dmsh_alpha.py	nvn:nvnColorStateSetAlphaTest	the alpha test libraries
+dm/gfx/tools/dmsh_alpha.py	nvn:nvnColorStateSetAlphaTest	the alpha test entry points
+dm/gfx/tools/dmsh_logic.py	nvn:nvnColorStateSetLogicOp	the logic operation entry points
+dm/gfx/tools/dmsh_side.py	shader:stage:ps	every pixel shader's compile unit and main0's shared body (side, integer, dual-source and readable-tile entry points)
 dm/gfx/tools/dmsh_geometry.py	shader:stage:gs	geometry shaders
 dm/gfx/tools/dmsh_facts.py	shader:stage:*	the translator's answer table
 dm/gfx/tools/dmsh_chain.*	shader:stage:*	the chain version: every NVN game's libraries are rebuilt
@@ -93,6 +103,10 @@ dm/tools/nso_*.py	*:*	the rewriter: every game's code
 dm/tools/sdk_patches.py	*:*	the SDK modules' patches (by build ID)
 dm/tools/romfs_image.py	*:*	RomFS image packing: every game's files
 dm/tools/romfs.py	*:*	RomFS image input: every game's build tools
+dm/gfx/nvn/msl_image.h	*:*	reads each shader from the one-file library: every NVN game
+dm/tools/shader_lib.py	*:*	the shader libraries as one file: every NVN game build and regress chain
+dm/tools/shader_cache.py	*:*	the compile cache as one file: every NVN game build and regress chain
+dm/tools/tree_tar.py	*:*	one tar in place of Xcode's derived data and quiet work folders: every game build
 dm/tools/nro_collect.py	*:*	NRO discovery from game resources during packing
 dm/tools/nx_extract/*	*:*	NSP extraction: every game's resource inputs
 dm/mac/launcher.c	*:*	Mac app resource discovery and host launch
@@ -109,6 +123,7 @@ dm/gfx/tools/uepak.py	shader:stage:*	Unreal archive input to shader scanning
 dm/host/romfs_image.h	hle:*fs*	RomFS image index validation shared by mounts and iOS startup
 dm/host/romfs_identity.h	*:*	RomFS identity checks at iOS startup for every game's separate deployment
 dm/host/hle_fs.c	hle:*fs*	filesystem mounts, paths and file operations
+dm/host/hle_audio.c:(notify_release|event_notify)	hle:*AudioOutE*	guest AudioOut buffer-release notifications; the host renderer uses rel_sem
 dm/host/save_sync.*	hle:*fs*	cloud saves: the first save mount and every Commit (hle_fs.c)
 dm/host/Makefile	*:*	the shared host build
 dm/host/hle_thread.c	svc:*	threads and synchronization
@@ -120,9 +135,13 @@ dm/host/hle.c	hle:*	the HLE tables
 dm/host/front_mac.m	present:*	the Mac front end
 dm/host/dm_input.h	hle:*hid*	the shared input interface
 dm/host/motion_apple.h	hle:*SixAxisSensor*	controller motion supplied by GameController
+dm/host/pad_apple.h	hle:*hid*	controller face buttons from GameController
 dm/host/motion_fusion.h	hle:*SixAxisSensor*	six-axis motion mapping and orientation
 dm/host/motion_pro.h	hle:*SixAxisSensor*	passive Switch Pro Controller IMU decoder
 dm/host/motion_pro_mac.h	hle:*SixAxisSensor*	Mac Pro Controller raw motion transport and routing
+dm/host/switch2_proto.h	hle:*hid*	Switch 2 controller protocol: reports, sticks, buttons, motion maps
+dm/host/pad_switch2_apple.h	hle:*hid*	Switch 2 controllers over Bluetooth LE (off unless DM_SW2=1)
+dm/host/pad_switch2_apple.m	hle:*hid*	Switch 2 controllers over Bluetooth LE (off unless DM_SW2=1)
 dm/host/front.h	present:*	the front end
 dm/ios/*	*:*	the iOS app
 dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Translation/Transforms/GeometryToCompute.cs	shader:stage:gs	geometry compute input and output lowering

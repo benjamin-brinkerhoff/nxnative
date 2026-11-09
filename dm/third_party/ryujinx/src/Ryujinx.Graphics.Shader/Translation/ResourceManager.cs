@@ -58,6 +58,9 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public ResourceReservations Reservations { get; }
 
+        // nxnative: TranslationFlags.MetalUniformBounds
+        public bool UniformBounds { get; set; }
+
         public ResourceManager(ShaderStage stage, IGpuAccessor gpuAccessor, ResourceReservations reservations = null)
         {
             _gpuAccessor = gpuAccessor;
@@ -66,8 +69,10 @@ namespace Ryujinx.Graphics.Shader.Translation
             _stage = stage;
             _stagePrefix = GetShaderStagePrefix(stage);
 
-            _cbSlotToBindingMap = new SetBindingPair[18];
-            _sbSlotToBindingMap = new SetBindingPair[16];
+            // Constant buffer banks 0-17 (Maxwell's), 24: NVN2's push constants (c[24]), and 25: the uniform slots' sizes (Constants.NxUniformSizesBank)
+            _cbSlotToBindingMap = new SetBindingPair[Constants.NxUniformSizesBank + 1];
+            // Storage buffers the global-to-storage pass found: the stage's storage buffer table and, for compute, its uniform buffer address table (NVN 16 + 16 slots)
+            _sbSlotToBindingMap = new SetBindingPair[32];
             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
 
@@ -123,6 +128,20 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
+        // nxnative: the scratch of Ampere HMMA (InstEmitAmpereTensor.AHmma, helper dmsh_hmma16816_f16): a shared memory of its own, 256 words for each subgroup of the
+        // workgroup, made the first time an HMMA needs it
+        public int HmmaScratchMemoryId { get; private set; } = -1;
+
+        public int GetHmmaScratchMemoryId(int subgroups)
+        {
+            if (HmmaScratchMemoryId < 0)
+            {
+                HmmaScratchMemoryId = Properties.AddSharedMemory(new MemoryDefinition("hmma_scratch", AggregateType.Array | AggregateType.U32, 256 * subgroups));
+            }
+
+            return HmmaScratchMemoryId;
+        }
+
         public void SetVertexAsComputeLocalMemories(ShaderStage stage, InputTopology inputTopology)
         {
             LocalVertexDataMemoryId = AddMemoryDefinition("local_vertex_data", AggregateType.Array | AggregateType.FP32, Reservations.OutputSizePerInvocation);
@@ -143,6 +162,26 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
+        // nxnative: the pool table entry a raw global memory helper chose last in this invocation (GlobalToStorage.TryGenerateRawStorageOp), one word for each helper, zero at the start
+        public int AddRawLastEntryMemory()
+        {
+            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
+        }
+
+        // nxnative: words 1 to 3 of a raw vector load (GlobalToStorage.TryGenerateRawStorageOp), one for the shader: the helper writes them and the loads of those words read them
+        // right after its call, before any other access
+        private int _rawVectorMemoryId = -1;
+
+        public int GetRawVectorMemory()
+        {
+            if (_rawVectorMemoryId < 0)
+            {
+                _rawVectorMemoryId = Properties.AddLocalMemory(new MemoryDefinition("gmem_vec", AggregateType.Array | AggregateType.U32, 3));
+            }
+
+            return _rawVectorMemoryId;
+        }
+
         private int AddMemoryDefinition(string name, AggregateType type, int arrayLength = 1)
         {
             return Properties.AddLocalMemory(new MemoryDefinition(name, type, arrayLength));
@@ -157,6 +196,35 @@ namespace Ryujinx.Graphics.Shader.Translation
                 _cbSlotToBindingMap[slot] = setAndBinding;
                 string slotNumber = slot.ToString(CultureInfo.InvariantCulture);
                 AddNewConstantBuffer(setAndBinding.SetIndex, setAndBinding.Binding, $"{_stagePrefix}_c{slotNumber}");
+
+                // nxnative: a game uniform slot's reads are bounded by the size the host puts in the size table (Constants.NxUniformSizesBank)
+                if (UniformBounds && slot >= Constants.NxFirstUniformSlot && slot < Constants.NxFirstUniformSlot + Constants.NxUniformSlots)
+                {
+                    Properties.AddBoundedConstantBuffer(setAndBinding.Binding, slot - Constants.NxFirstUniformSlot, GetUniformSizesBinding());
+                }
+            }
+
+            return setAndBinding.Binding;
+        }
+
+        // nxnative: the size table, bank Constants.NxUniformSizesBank: one u32 a game uniform slot, in uint4 data[4] (a std140 array of u32 would take 16 bytes an element)
+        private int GetUniformSizesBinding()
+        {
+            int slot = Constants.NxUniformSizesBank;
+            SetBindingPair setAndBinding = _cbSlotToBindingMap[slot];
+
+            if (setAndBinding.Binding < 0)
+            {
+                setAndBinding = _gpuAccessor.CreateConstantBufferBinding(slot);
+                _cbSlotToBindingMap[slot] = setAndBinding;
+
+                StructureType type = new(new[]
+                {
+                    new StructureField(AggregateType.Array | AggregateType.Vector4 | AggregateType.U32, "data", (Constants.NxUniformSlots + 3) / 4),
+                });
+
+                Properties.AddOrUpdateConstantBuffer(new(BufferLayout.Std140, setAndBinding.SetIndex, setAndBinding.Binding, $"{_stagePrefix}_c{slot.ToString(CultureInfo.InvariantCulture)}", type));
+                SetUsedConstantBufferBinding(setAndBinding.Binding);
             }
 
             return setAndBinding.Binding;
