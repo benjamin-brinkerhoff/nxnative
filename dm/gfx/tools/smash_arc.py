@@ -17,9 +17,17 @@ def zstd_mod():   # compression.zstd from Python 3.14, its backport before (pip 
     return zstd
 
 
+def inflate(raw, what):   # the one zstd frame in raw, inflated; bytes past the frame's end (a stored size that counts padding, or the whole section) are not part of it: the one-shot zstd.decompress reads them as another frame and fails with 'Unknown frame descriptor'
+    zstd = zstd_mod(); dec = zstd.ZstdDecompressor()
+    try: out = dec.decompress(raw)
+    except zstd.ZstdError as e: sys.exit(f'[RED] {what}: the zstd frame does not inflate: {e}')
+    if not dec.eof: sys.exit(f'[RED] {what}: the zstd frame is cut short in {len(raw):#x} stored bytes')
+    return out
+
+
 def files(path, regions=False):
     """Super Smash Bros. Ultimate's data.arc (17.6 GB at 13.0.5): u64 magic 0xABCDEF9876543210, then u64 offsets of the music section, the file section, the shared file section,
-    the file system table and its search table. The table is {u32 data start (0x10), u32 size, u32 stored size, u32 section size} and one zstd frame. Inflated: a 0x58-byte header
+    the file system table and its search table. The table is {u32 data start (0x10), u32 size, u32 stored size, u32 section size} and one zstd frame (or the table stored whole, in a repacked archive). Inflated: a 0x58-byte header
     (u32 table size, path count, path-to-info index count, directory count, directory offset count, child hash count, file info count, info-to-data count, file data count,
     second directory offset count, second file data count, 0, 0x10, 0x10, u8 region count, u8 language count, u16, u32 version (0x000d0005 = 13.0.5), extra directory offsets,
     extra files, 0, extra files again, extra info-to-data, extra info-to-data sub count), the regions (12 bytes each), the stream header {quick directory count, stream hash count,
@@ -37,7 +45,10 @@ def files(path, regions=False):
         if h[:8] != MAGIC: return None
         file_off, fs_off = struct.unpack_from('<Q', h, 0x10)[0], struct.unpack_from('<Q', h, 0x20)[0]
         f.seek(fs_off); _, size, stored, _ = struct.unpack('<4I', f.read(16))
-        fs = zstd_mod().decompress(f.read(stored))
+        raw = f.read(stored)
+    if raw[:4] == ZSTD_MAGIC: fs = inflate(raw, f'{path}: file system table')
+    elif stored == size: fs = raw   # a repacked archive may store the table whole, as read() allows for a file's data
+    else: sys.exit(f'[RED] {path}: the file system table at {fs_off:#x} is no zstd frame and is not stored whole (size {size:#x}, stored {stored:#x}, starts {raw[:8].hex()})')
     if len(fs) != size: sys.exit(f'[RED] {path}: file system table inflates to {len(fs):#x} bytes, its header says {size:#x}')
     (tsize, n_paths, n_idx, n_dirs, n_off1, n_hfold, n_info, n_sub, n_data, n_off2, n_data2, _) = struct.unpack_from('<12I', fs, 0)
     version, extra_dirs, extra_files, _, _, extra_f2d, _ = struct.unpack_from('<7I', fs, 0x3c)
@@ -78,4 +89,4 @@ def hash40(s):   # a path's or extension's Hash40: CRC-32 and length
 def read(m, e):
     """A file's bytes (m: the archive's bytes or mmap; e: an entry of files()), inflated when stored as a zstd frame"""
     d = m[e[1]:e[1] + e[2]]
-    return zstd_mod().decompress(d) if d[:4] == ZSTD_MAGIC else d[:e[3]]
+    return inflate(d, f'the file at {e[1]:#x} (Hash40 {e[0]:010x})') if d[:4] == ZSTD_MAGIC else d[:e[3]]
