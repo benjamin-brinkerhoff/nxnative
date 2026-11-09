@@ -21,7 +21,15 @@ The offsets of each level and layer within the storage, and the block height and
 
 ## BC textures
 
-Only GPUs with BC compressed textures are supported (`supportsBCTextureCompression` of `MTLDevice`: Apple silicon Macs and the latest iPhones), so BC textures are created and uploaded as BC; there is no decompression path. A BC texture is never a render target and its raw blocks are not sampled through an uncompressed view (Metal has no such views; Breath of the Wild encodes one 32×32 BC4 texture on the GPU, GitHub issue #4).
+On GPUs without hardware BC texture compression (`supportsBCTextureCompression == NO` on `MTLGPUFamilyApple8` / A16 Bionic and earlier, such as the iPhone 15 base model):
+
+- 2D, 2D array, cube, and cube array `BC1–BC3` and `BC7` textures (`0x41–0x48`, `0x4d–0x4e`) are transcoded at upload time to `MTLPixelFormatASTC_4x4_LDR` / `MTLPixelFormatASTC_4x4_sRGB` (16 bytes per 4×4 block = 1 byte/pixel, reducing texture memory by 75% compared to `RGBA8`). `BC1–BC3` blocks are transcoded on the GPU by the `bcd` compute kernel in `../nvn/nvn_mtl.m`, while `BC7` blocks are transcoded on the CPU through `nvn_bcdec.c`. Set `DM_BC_ASTC=0` to unpack to `RGBA8` instead;
+- unsigned `BC6H` (`0x50`) textures are unpacked to `MTLPixelFormatRG11B10Float` (4 bytes/pixel, saving 50% memory vs `RGBA16Float`), and signed `BC6H` (`0x4f`) textures use `MTLPixelFormatRGBA16Float`;
+- `BC4` (`0x49–0x4a`) and `BC5` (`0x4b–0x4c`) textures are decoded on the GPU into `R8Unorm` / `R8Snorm` (1 byte/pixel) and `RG8Unorm` / `RG8Snorm` (2 bytes/pixel);
+- 3D `BC` textures (`target == 2`, where Metal disallows 2D ASTC formats) are decoded into `RGBA8Unorm` / `RGBA8Unorm_sRGB`;
+- a `BC` texture is never a render target and its raw blocks are not sampled through an uncompressed view (Metal has no such views; Breath of the Wild encodes one 32×32 BC4 texture on the GPU, GitHub issue #4).
+
+The environment variable `DM_TEST_NO_BC=1` forces this path on any GPU.
 
 ## Tests
 

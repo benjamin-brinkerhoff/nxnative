@@ -10,6 +10,7 @@
 #include "dm.h"
 #include "haptics_apple.h"
 #include "save_sync.h"
+#include "../../gfx/nvn/nvn_mtl.h"
 #import "CloudSaves.h"
 
 UIView *dm_gamepad_view(CGRect frame);
@@ -77,6 +78,10 @@ static void launcher_done(void) { [g_root startGame]; }
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
+    if (g_layer.device && ![g_layer.device supportsBCTextureCompression] && !getenv("DM_OPMODE")) {
+        setenv("DM_OPMODE", "0", 0);   // Default to Handheld (720p) on non-BC / 6 GB devices (e.g. iPhone 15 base model) to cut G-buffer RAM by 55%
+        LOG("front end: non-BC GPU detected; defaulting DM_OPMODE=0 (Handheld 720p) to conserve memory");
+    }
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
     dm_haptics_apple_init();
     self.pad = dm_gamepad_view(self.view.bounds);
@@ -130,6 +135,8 @@ static void front_ios_power_watch(void) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: Low Power Mode → %s (%.0f s after launch)", dm_low_power_now() ? "on" : "off", (now_ns() - g_t0_ns) / 1e9); }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        (void)n; LOG("front end: received iOS memory warning; trimming Metal caches"); mtl_trim_memory(1); }];
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off");
 }
 

@@ -19,6 +19,7 @@
 // Environment: DM_GL_LOG=1 logs object creation; DM_GL_CAPTURE=<dir> writes every shader source the game compiles (<key>.vert / <key>.frag, read by gl_shaders.py).
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
+#include "../tex/nvn_bcdec.h"
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach/mach.h>
@@ -489,12 +490,39 @@ static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
     }
     return -1;
 }
+static uint32_t gl_fmt_nvn_bc(int f) {
+    switch (f) {
+        case F_BC1_RGB: return 0x41; case F_BC1: return 0x42; case F_BC2: return 0x43; case F_BC3: return 0x44;
+        case F_BC1_SRGB: return 0x46; case F_BC2_SRGB: return 0x47; case F_BC3_SRGB: return 0x48;
+        case F_BC4: return 0x49; case F_BC4S: return 0x4a; case F_BC5: return 0x4b; case F_BC5S: return 0x4c;
+        case F_BC7: return 0x4d; case F_BC7_SRGB: return 0x4e; case F_BC6S: return 0x4f; case F_BC6U: return 0x50;
+        default: return 0;
+    }
+}
+static int gl_no_bc(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_TEST_NO_BC"); v = (e && *e && strcmp(e, "0")) || ![g_dev supportsBCTextureCompression]; }
+    return v;
+}
 static size_t fmt_pitch(int f, uint32_t w) { const fmt_t *m = &g_fmt[f]; return (size_t)((w + m->bw - 1) / m->bw) * m->bytes; }
 static size_t fmt_rows(int f, uint32_t h) { const fmt_t *m = &g_fmt[f]; return (h + m->bh - 1) / m->bh; }
+static size_t fmt_target_rows(int f, uint32_t h) {
+    uint32_t nvn_f = gl_no_bc() ? gl_fmt_nvn_bc(f) : 0, upf = 0; int ubw = 1, ubh = 1, ubpb = 0;
+    if (nvn_f && nvn_bc_target_fmt(nvn_f, 1, &upf, &ubw, &ubh, &ubpb)) return (h + (uint32_t)ubh - 1) / (uint32_t)ubh;
+    return fmt_rows(f, h);
+}
 
 // The given pixels (GL unpack rules: rows of unpack_row or w pixels, each row aligned to unpack_align) → the Metal texture's bytes, rows packed. NULL data → zeros
 static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum format, GLenum type, int f, int cv, size_t *pitch_out) {
     size_t dp = fmt_pitch(f, w), rows = fmt_rows(f, h);
+    uint32_t nvn_f = gl_no_bc() ? gl_fmt_nvn_bc(f) : 0, upf = 0; int ubw = 1, ubh = 1, ubpb = 0;
+    if (nvn_f && nvn_bc_target_fmt(nvn_f, 1, &upf, &ubw, &ubh, &ubpb)) {
+        size_t tdp = (size_t)((w + (uint32_t)ubw - 1) / (uint32_t)ubw) * (size_t)ubpb;
+        size_t trows = (h + (uint32_t)ubh - 1) / (uint32_t)ubh;
+        uint8_t *dst = zalloc(tdp * trows + 1); *pitch_out = tdp;
+        if (src) nvn_bc_decode_target(nvn_f, 1, (const uint8_t *)src, dp, w, h, dst, tdp);
+        return dst;
+    }
     uint8_t *dst = zalloc(dp * rows + 1); *pitch_out = dp;
     if (!src) return dst;
     if (g_fmt[f].kind == K_BLOCK) { memcpy(dst, src, dp * rows); return dst; }   // compressed data has no unpack rows
@@ -582,7 +610,9 @@ static int tex_make(tex_t *t, int rt) {
     @autoreleasepool {
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
         td.textureType = faces == 6 ? MTLTextureTypeCube : vol ? MTLTextureType3D : arr ? MTLTextureType2DArray : MTLTextureType2D;
-        td.pixelFormat = m->pf; td.width = t->w; td.height = faces == 6 ? t->w : t->h;
+        uint32_t upf = (uint32_t)m->pf; int ubw = 1, ubh = 1, ubpb = 0;
+        if (gl_no_bc() && gl_fmt_nvn_bc(t->fmt)) nvn_bc_target_fmt(gl_fmt_nvn_bc(t->fmt), vol ? 2 : 1, &upf, &ubw, &ubh, &ubpb);
+        td.pixelFormat = (MTLPixelFormat)upf; td.width = t->w; td.height = faces == 6 ? t->w : t->h;
         if (vol) td.depth = umax(1, t->d); else if (arr) td.arrayLength = umax(1, t->d);
         td.mipmapLevelCount = lv;
         MTLTextureSwizzleChannels sw = tex_swz(t);
@@ -612,7 +642,7 @@ static int tex_make(tex_t *t, int rt) {
 // face: the cube face or array layer; z: the slice of a 3D texture
 static void tex_write(tex_t *t, int face, int lv, uint32_t x, uint32_t y, uint32_t z, uint32_t w, uint32_t h, const void *data, size_t pitch) {
     g_n_up++;
-    size_t rows = fmt_rows(t->fmt, h);
+    size_t rows = fmt_target_rows(t->fmt, h);
     if (t->use <= atomic_load(&g_done) && t->tex.storageMode == MTLStorageModeShared) {
         [t->tex replaceRegion:MTLRegionMake3D(x, y, z, w, h, 1) mipmapLevel:lv slice:face withBytes:data bytesPerRow:pitch bytesPerImage:t->target == GL_TEXTURE_3D ? pitch * rows : 0];
         return;
@@ -641,7 +671,7 @@ static void tex_image(GLenum target, GLint level, int f, int cv, uint32_t w, uin
     if (t->made && level < t->levels && t->tex) { if (conv) tex_write(t, face, level, 0, 0, 0, w, h, conv, pitch); free(conv); return; }
     if (t->made) { RED1("texture level %d given after the texture was made with %d levels: ignored", level, t->levels); free(conv); return; }
     level_t *l = &t->pend[face][level]; lv_free(l);
-    *l = (level_t){conv, pitch, pitch * fmt_rows(f, h), w, h};
+    *l = (level_t){conv, pitch, pitch * fmt_target_rows(f, h), w, h};
     int faces = t->target == GL_TEXTURE_CUBE_MAP ? 6 : 1, all = 1;
     for (int k = 0; k < faces; k++) all &= t->pend[k][level].data != NULL || (level == 0 && !conv);
     if (all) t->defined |= 1 << level;

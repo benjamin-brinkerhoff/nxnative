@@ -22,6 +22,7 @@
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
+#include "../tex/nvn_bcdec.h"
 #include "nvn_builtin.h"
 #include "nvn_dirty.h"
 #include "nvn_depth_clear.h"
@@ -1602,6 +1603,7 @@ typedef struct { MTLPixelFormat a, b; } pfv_pair;
 static const pfv_pair g_pfv_srgb[] = {
     {MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB},
     {MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB},
+    {MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_4x4_sRGB},
     {MTLPixelFormatBC1_RGBA, MTLPixelFormatBC1_RGBA_sRGB},
     {MTLPixelFormatBC2_RGBA, MTLPixelFormatBC2_RGBA_sRGB},
     {MTLPixelFormatBC3_RGBA, MTLPixelFormatBC3_RGBA_sRGB},
@@ -1684,7 +1686,33 @@ void mtl_alias_drop_pool(const void *pool) {
 // finalizes the texture before the next one: each image added an entry, 468 of them and 1.58 GB of GPU memory 24,000 frames into a new game. A finalized object resolved through g_ghost
 // keeps its own reference, so the entry's reference is only unref'd while one does; otherwise the texture is retired (deferred until the submissions that used it complete).
 // Cached texture-ID views follow g_ser_gen. Caller holds g_smu
-enum { ALIAS_IDLE = 16 };
+enum { ALIAS_IDLE = 16, ALIAS_IDLE_LOW = 4 };
+static int no_bc(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_TEST_NO_BC");
+        v = (e && *e && strcmp(e, "0")) || ![g_dev supportsBCTextureCompression];
+        if (v) MLOG("GPU lacks hardware BC texture compression%s: 2D BC1-3/BC7 -> ASTC 4x4, BC6H_U -> RG11B10Float, BC4/BC5 -> R8/RG8",
+                    (e && *e && strcmp(e, "0")) ? " (DM_TEST_NO_BC)" : "");
+    }
+    return v;
+}
+static size_t avail_mem_bytes(void) {
+#if TARGET_OS_IPHONE
+    return os_proc_available_memory();
+#else
+    return 0;
+#endif
+}
+static int low_mem_device(void) {
+    static int v = -1;
+    if (v < 0) {
+        size_t avail = avail_mem_bytes();
+        v = no_bc() || (avail > 0 && avail < (3500ULL << 20));
+    }
+    return v;
+}
+static inline uint64_t alias_idle_limit(void) { return low_mem_device() ? ALIAS_IDLE_LOW : ALIAS_IDLE; }
 static uint64_t g_alias_taken;   // shared textures evicted when another texture took over their storage (for the memory report)
 static nvn_hmap g_ghost;   // defined below (finalized texture serials)
 static int serial_holds(nvn_hmap *m, id o) { for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i] == (__bridge void *)o) return 1; return 0; }
@@ -1699,7 +1727,7 @@ static void alias_take_over(const alias_key *nk) {
         if (k.pool != nk->pool || !memcmp(&k, nk, sizeof k) || k.off >= hi) continue;
         nvn_texlayout kl; nvn_tex_layout(&k.d, &kl);
         uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
-        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < ALIAS_IDLE) || serial_holds(&g_by_serial, (__bridge id)g_alias.vals[i])) continue;
+        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < alias_idle_limit()) || serial_holds(&g_by_serial, (__bridge id)g_alias.vals[i])) continue;
         ks[n++] = k;
     }
     for (uint32_t j = 0; j < n; j++) {
@@ -1720,7 +1748,8 @@ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get
 // (the HUD captures, the 640x360 half-resolution buffers) and finalizes their objects before it submits. Those serials went back into g_by_serial and stayed there for good, as no second
 // Finalize comes: about 10 a frame, 200,000 after an hour in the first shrine. A dead serial resolves through g_ghost instead, a small table whose oldest entry goes when a new one comes,
 // so a record replayed again soon still finds its texture
-enum { NGHOST = 512 };
+enum { NGHOST = 512, NGHOST_LOW = 64 };
+static inline unsigned ghost_cap(void) { return low_mem_device() ? NGHOST_LOW : NGHOST; }
 static nvn_hmap g_tex_live = {.klen = 8};   // serial → (void *)1, under g_smu
 static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
 void mtl_tex_init(const tex_t *t) {
@@ -1741,7 +1770,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
     id old = hm_get_id(m, &k);
     if (old) obj_drop(old);
     else if (m == &g_ghost) {
-        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
+        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % ghost_cap()];
         if (*slot) { id ev = hm_get_id(&g_ghost, slot); if (ev) obj_drop(ev); hm_del_id(&g_ghost, slot); }
         *slot = k; g_ghost_puts++;
     }
@@ -1851,9 +1880,13 @@ static MTLTextureUsage img_usage(const tex_t *t, MTLPixelFormat pf) {
 // Metal leaves MTLTextureUsageShaderAtomic out of a texture's usage property (0x3 for a texture made with 0x23), so it cannot be read back: every shader-writable R32Uint / R32Sint
 // texture the host makes has it (img_usage, tex_upgrade, dummy_img_atomic), and that is what this tests
 static int tex_atomic_capable(id<MTLTexture> base) { return pf_r32i(base.pixelFormat) && (base.usage & MTLTextureUsageShaderWrite); }
+static int bc_target_fmt(uint32_t nvn_fmt, int target, uint32_t *pf, int *bw, int *bh, int *bpb) {
+    return no_bc() && nvn_bc_target_fmt(nvn_fmt, target, pf, bw, bh, bpb);
+}
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+    { uint32_t upf = 0; int ubw = 1, ubh = 1, ubpb = 0; if (bc_target_fmt(t->d.format, t->d.target, &upf, &ubw, &ubh, &ubpb)) pf = upf; }
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -1984,7 +2017,8 @@ static void up_wait_zero(_Atomic int *v, int site) {
     if (ws_on()) ws_put(site, w0, 1);
 }
 static unsigned g_up_seq;
-#define UP_BLOCK_SIZE (32u * 1024u * 1024u)
+#define UP_BLOCK_SIZE (low_mem_device() ? (8u * 1024u * 1024u) : (32u * 1024u * 1024u))
+#define UP_BATCH_BYTES (low_mem_device() ? (32u * 1024u * 1024u) : (128u * 1024u * 1024u))
 // Each upload slot keeps its staging resident until its next batch (up_begin waits for the previous batch). Grow the first block to the slot's previous batch demand, not just its first texture:
 // a small first texture followed by a large one otherwise allocates and retires a fresh 32 MB overflow every frame. Keep one overflow as well, at most 64 MB per slot / 192 MB across all three.
 // Bursts beyond that budget and individual uploads larger than UP_BLOCK_SIZE still use temporary blocks, retired only after their GPU work. DM_NVN_UPLOAD_REUSE=0 keeps the original one-block policy.
@@ -2001,6 +2035,137 @@ typedef struct {
     NSUInteger slice, level;
 } up_blit;
 static up_blit *g_up_blits; static int g_nup_blits, g_up_blitcap;
+// GPU buffer-to-buffer BC1-BC5 transcode / decode on non-BC GPUs (iPhone 15 base model / A16 Bionic):
+// fmt 1..4: BC1_RGB, BC1_RGBA, BC2, BC3 -> ASTC 4x4 (16 bytes per 4x4 block in dst buffer)
+// fmt 5..8: BC4_U, BC4_S, BC5_U, BC5_S -> R8 / RG8 (in dst buffer)
+// fmt 9..12: BC1_RGB, BC1_RGBA, BC2, BC3 -> RGBA8 (when target == 2 or DM_BC_ASTC=0)
+typedef struct { __unsafe_unretained id<MTLBuffer> stg, params; size_t poff; uint32_t bw, bh; } up_dec;
+static up_dec *g_up_decs; static int g_nup_decs, g_up_deccap;
+static const char k_bcd_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct P { uint soff, spitch, w, h, fmt, doff, dpitch, pad; };\n"
+"constant uchar k_q47_deq[48] = {0,5,11,16,21,27,32,38,43,48,54,59,65,70,76,81,86,92,97,103,108,113,119,124,131,136,142,147,152,158,163,169,174,179,185,190,196,201,207,212,217,223,228,234,239,244,250,255};\n"
+"constant uchar k_q47_ise[48] = {0,16,32,2,18,34,4,20,36,6,22,38,8,24,40,10,26,42,12,28,44,14,30,46,47,31,15,45,29,13,43,27,11,41,25,9,39,23,7,37,21,5,35,19,3,33,17,1};\n"
+"constant uchar k_trit_enc[243] = {0,1,2,4,5,6,8,9,10,16,17,18,20,21,22,24,25,26,3,7,11,19,23,27,12,13,14,32,33,34,36,37,38,40,41,42,48,49,50,52,53,54,56,57,58,35,39,43,51,55,59,44,45,46,64,65,66,68,69,70,72,73,74,80,81,82,84,85,86,88,89,90,67,71,75,83,87,91,76,77,78,128,129,130,132,133,134,136,137,138,144,145,146,148,149,150,152,153,154,131,135,139,147,151,155,140,141,142,160,161,162,164,165,166,168,169,170,176,177,178,180,181,182,184,185,186,163,167,171,179,183,187,172,173,174,192,193,194,196,197,198,200,201,202,208,209,210,212,213,214,216,217,218,195,199,203,211,215,219,204,205,206,96,97,98,100,101,102,104,105,106,112,113,114,116,117,118,120,121,122,99,103,107,115,119,123,108,109,110,224,225,226,228,229,230,232,233,234,240,241,242,244,245,246,248,249,250,227,231,235,243,247,251,236,237,238,28,29,30,60,61,62,92,93,94,156,157,158,188,189,190,220,221,222,31,63,95,159,191,223,124,125,126};\n"
+"static uint pack5t(thread const uchar *v) {\n"
+"  int tr = (v[0]>>4) + (v[1]>>4)*3 + (v[2]>>4)*9 + (v[3]>>4)*27 + (v[4]>>4)*81;\n"
+"  uint T = k_trit_enc[tr], b0 = v[0]&15u, b1 = v[1]&15u, b2 = v[2]&15u, b3 = v[3]&15u, b4 = v[4]&15u;\n"
+"  uint lo10 = b0 | ((T & 3u) << 4) | (b1 << 6);\n"
+"  uint hi18 = ((T >> 2) & 3u) | (b2 << 2) | (((T >> 4) & 1u) << 6) | (b3 << 7) | (((T >> 5) & 3u) << 11) | (b4 << 13) | (((T >> 7) & 1u) << 17);\n"
+"  return lo10 | (hi18 << 10); }\n"
+"static void write_u64_pair(device uchar *out, ulong lo, ulong hi) {\n"
+"  for (int i = 0; i < 8; i++) { out[i] = uchar((lo >> (i * 8)) & 255u); out[i + 8] = uchar((hi >> (i * 8)) & 255u); } }\n"
+"static void a8_u(device const uchar *b, thread uchar *o, bool sn) {\n"
+"  if (!sn) {\n"
+"    uint a0 = b[0], a1 = b[1]; uchar p[8]; p[0] = uchar(a0); p[1] = uchar(a1);\n"
+"    if (a0 > a1) { for (int k = 2; k < 8; k++) p[k] = uchar(((8 - k) * a0 + (k - 1) * a1 + 3) / 7); }\n"
+"    else { for (int k = 2; k < 6; k++) p[k] = uchar(((6 - k) * a0 + (k - 1) * a1 + 2) / 5); p[6] = 0; p[7] = 255; }\n"
+"    uint lo24 = b[2] | (uint(b[3]) << 8) | (uint(b[4]) << 16), hi24 = b[5] | (uint(b[6]) << 8) | (uint(b[7]) << 16);\n"
+"    for (int i = 0; i < 16; i++) o[i] = p[i < 8 ? (lo24 >> (3 * i)) & 7u : (hi24 >> (3 * (i - 8))) & 7u];\n"
+"  } else {\n"
+"    int a0 = int(as_type<char>(b[0])), a1 = int(as_type<char>(b[1])); char p[8]; p[0] = char(a0); p[1] = char(a1);\n"
+"    if (a0 > a1) { for (int k = 2; k < 8; k++) p[k] = char(((8 - k) * a0 + (k - 1) * a1) / 7); }\n"
+"    else { for (int k = 2; k < 6; k++) p[k] = char(((6 - k) * a0 + (k - 1) * a1) / 5); p[6] = -127; p[7] = 127; }\n"
+"    uint lo24 = b[2] | (uint(b[3]) << 8) | (uint(b[4]) << 16), hi24 = b[5] | (uint(b[6]) << 8) | (uint(b[7]) << 16);\n"
+"    for (int i = 0; i < 16; i++) o[i] = as_type<uchar>(p[i < 8 ? (lo24 >> (3 * i)) & 7u : (hi24 >> (3 * (i - 8))) & 7u]);\n"
+"  } }\n"
+"kernel void bcd(device const uchar *src [[buffer(0)]], device const P &p [[buffer(1)]], device uchar *dst [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {\n"
+"  uint nbx = (p.w + 3) / 4, nby = (p.h + 3) / 4; if (g.x >= nbx || g.y >= nby) return;\n"
+"  uint bb = (p.fmt == 1 || p.fmt == 2 || p.fmt == 5 || p.fmt == 6 || p.fmt == 9 || p.fmt == 10) ? 8u : 16u;\n"
+"  device const uchar *b = src + p.soff + g.y * p.spitch + g.x * bb;\n"
+"  if (p.fmt >= 1 && p.fmt <= 4) {\n"
+"    device const uchar *cb = (p.fmt >= 3) ? (b + 8) : b;\n"
+"    uint c0 = cb[0] | (uint(cb[1]) << 8), c1 = cb[2] | (uint(cb[3]) << 8);\n"
+"    uint ix = cb[4] | (uint(cb[5]) << 8) | (uint(cb[6]) << 16) | (uint(cb[7]) << 24);\n"
+"    int r0 = int((c0 >> 11) & 31u) * 255 / 31, g0 = int((c0 >> 5) & 63u) * 255 / 63, b0 = int(c0 & 31u) * 255 / 31;\n"
+"    int r1 = int((c1 >> 11) & 31u) * 255 / 31, g1 = int((c1 >> 5) & 63u) * 255 / 63, b1 = int(c1 & 31u) * 255 / 31;\n"
+"    bool four_col = (p.fmt >= 3) || (c0 > c1);\n"
+"    uchar a[16]; uchar amin = 255, amax = 255;\n"
+"    if (p.fmt == 2 && !four_col) {\n"
+"      for (int i = 0; i < 16; i++) { uchar av = (((ix >> (2 * i)) & 3u) == 3u) ? 0 : 255; a[i] = av; if (av < amin) amin = av; }\n"
+"    } else if (p.fmt == 3) {\n"
+"      amin = 255; amax = 0; for (int i = 0; i < 16; i++) { uchar av = uchar(((b[i >> 1] >> ((i & 1) * 4)) & 15u) * 17u); a[i] = av; if (av < amin) amin = av; if (av > amax) amax = av; }\n"
+"    } else if (p.fmt == 4) {\n"
+"      a8_u(b, a, false); amin = 255; amax = 0; for (int i = 0; i < 16; i++) { if (a[i] < amin) amin = a[i]; if (a[i] > amax) amax = a[i]; }\n"
+"    }\n"
+"    device uchar *out = dst + p.doff + g.y * p.dpitch + g.x * 16u;\n"
+"    if (amin == 255) {\n"
+"      bool sw = (r0 + g0 + b0 > r1 + g1 + b1);\n"
+"      if (sw) { int t = r0; r0 = r1; r1 = t; t = g0; g0 = g1; g1 = t; t = b0; b0 = b1; b1 = t; }\n"
+"      ulong ep48 = ulong(r0) | (ulong(r1) << 8) | (ulong(g0) << 16) | (ulong(g1) << 24) | (ulong(b0) << 32) | (ulong(b1) << 40);\n"
+"      if (four_col) {\n"
+"        constant uchar m2[4] = {0, 3, 1, 2}; ulong w32 = 0;\n"
+"        for (int i = 0; i < 16; i++) { uint w = uint(m2[(ix >> (2 * i)) & 3u]) ^ (sw ? 3u : 0u); w32 |= ulong(w) << (2 * i); }\n"
+"        write_u64_pair(out, 0x10042ULL | (ep48 << 17), (ep48 >> 47) | reverse_bits(w32));\n"
+"      } else {\n"
+"        constant uchar m3[4] = {0, 7, 3, 0}, m3s[4] = {7, 0, 4, 7}; ulong w48 = 0;\n"
+"        for (int i = 0; i < 16; i++) { uint idx = (ix >> (2 * i)) & 3u; uint w = sw ? m3s[idx] : m3[idx]; w48 |= ulong(w) << (3 * i); }\n"
+"        write_u64_pair(out, 0x10053ULL | (ep48 << 17), (ep48 >> 47) | reverse_bits(w48));\n"
+"      }\n"
+"      return;\n"
+"    }\n"
+"    int qr0 = (r0 * 47 + 127) / 255, qr1 = (r1 * 47 + 127) / 255, qg0 = (g0 * 47 + 127) / 255, qg1 = (g1 * 47 + 127) / 255, qb0 = (b0 * 47 + 127) / 255, qb1 = (b1 * 47 + 127) / 255;\n"
+"    int qa0 = (int(amin) * 47 + 127) / 255, qa1 = (int(amax) * 47 + 127) / 255;\n"
+"    bool sw = (int(k_q47_deq[qr0]) + int(k_q47_deq[qg0]) + int(k_q47_deq[qb0]) > int(k_q47_deq[qr1]) + int(k_q47_deq[qg1]) + int(k_q47_deq[qb1]));\n"
+"    if (sw) { int t = qr0; qr0 = qr1; qr1 = t; t = qg0; qg0 = qg1; qg1 = t; t = qb0; qb0 = qb1; qb1 = t; }\n"
+"    constant uchar m2[4] = {0, 3, 1, 2}, m2_3[4] = {0, 3, 1, 0};\n"
+"    int da = int(amax) - int(amin); ulong w64 = 0;\n"
+"    for (int i = 0; i < 16; i++) {\n"
+"      uint idx = (ix >> (2 * i)) & 3u;\n"
+"      uint wc = uint(four_col ? m2[idx] : m2_3[idx]) ^ (sw ? 3u : 0u);\n"
+"      uint wa = (da > 0) ? uint(((int(a[i]) - int(amin)) * 3 + (da >> 1)) / da) : 0u;\n"
+"      w64 |= ulong(wc | (wa << 2)) << (4 * i);\n"
+"    }\n"
+"    uchar ev0[5] = {k_q47_ise[qr0], k_q47_ise[qr1], k_q47_ise[qg0], k_q47_ise[qg1], k_q47_ise[qb0]};\n"
+"    uchar ev1[5] = {k_q47_ise[qb1], k_q47_ise[qa0], k_q47_ise[qa1], 0, 0};\n"
+"    ulong ep45 = ulong(pack5t(ev0)) | ((ulong(pack5t(ev1)) & 0x1FFFFULL) << 28);\n"
+"    write_u64_pair(out, 0x18442ULL | (ep45 << 17) | (3ULL << 62), reverse_bits(w64));\n"
+"    return;\n"
+"  }\n"
+"  if (p.fmt >= 5 && p.fmt <= 8) {\n"
+"    uchar r[16], gr[16]; bool sn = (p.fmt == 6 || p.fmt == 8), rg = (p.fmt >= 7);\n"
+"    a8_u(b, r, sn); if (rg) a8_u(b + 8, gr, sn);\n"
+"    for (uint i = 0; i < 16; i++) {\n"
+"      uint x = g.x * 4u + (i & 3u), y = g.y * 4u + (i >> 2);\n"
+"      if (x < p.w && y < p.h) {\n"
+"        device uchar *d = dst + p.doff + y * p.dpitch + x * (rg ? 2u : 1u);\n"
+"        d[0] = r[i]; if (rg) d[1] = gr[i];\n"
+"      }\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"}\n";
+static int bcd_fmt(uint32_t f, int target) {   // NVN format -> bcd fmt (1..8); 0 = CPU fallback (BC6H / BC7 / 3D / DM_BC_ASTC=0)
+    if (target == 2) return 0;
+    if (nvn_bc_astc_on()) {
+        switch (f) {
+            case 0x41: case 0x45: return 1;
+            case 0x42: case 0x46: return 2;
+            case 0x43: case 0x47: return 3;
+            case 0x44: case 0x48: return 4;
+            default: break;
+        }
+    }
+    switch (f) {
+        case 0x49: return 5;
+        case 0x4a: return 6;
+        case 0x4b: return 7;
+        case 0x4c: return 8;
+        default: return 0;
+    }
+}
+static id<MTLComputePipelineState> bcd_pso(void) {
+    static id<MTLComputePipelineState> ps; static int failed;
+    if (!ps && !failed) {
+        NSError *e = nil;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_bcd_msl) options:nil error:&e];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"bcd"] : nil;
+        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        if (!ps) { failed = 1; MLOG("[RED] no-BC: failed to create GPU BC->ASTC/R8/RG8 pipeline: %s (falling back to CPU)", e.localizedDescription.UTF8String); }
+        else MLOG("no-BC: GPU BC1-3 -> ASTC 4x4 & BC4-5 -> R8/RG8 compute pipeline active");
+    }
+    return ps;
+}
 static NSMutableArray *g_up_texs, *g_up_views;   // Targets and temporary integer-write views kept through their upload
 static id<MTLBuffer> g_up_block;
 static size_t g_up_block_off, g_up_block_size;
@@ -2009,7 +2174,6 @@ static NSMutableArray *g_up_keep;
 // batches; up_begin publishes queued commits before waiting for a slot. A single
 // texture larger than the budget gets its own block (uploads are not tiled here).
 static size_t g_up_staging_bytes;
-#define UP_BATCH_BYTES (128u * 1024u * 1024u)
 
 
 // The upload command buffer was discarded by the system (dropped along during GPU error recovery; the first frame on entering Travincal drops one every run): the objects of this batch of textures are built and the timestamps updated, but the content was never written in,
@@ -2026,8 +2190,19 @@ static void up_flush(void) {
     if (g_up_ce) {
         m4_end(g_up_ce); g_up_ce = nil;
     }
-    id<MTL4ComputeCommandEncoder> b = g_nup_blits ? g_up_ce = [g_up_cb computeCommandEncoder] : nil;
+    id<MTL4ComputeCommandEncoder> b = (g_nup_blits || g_nup_decs) ? g_up_ce = [g_up_cb computeCommandEncoder] : nil;
     if (b) [b barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
+    if (b && g_nup_decs) {
+        [b setArgumentTable:g_up_ct]; [b setComputePipelineState:bcd_pso()];
+        for (int i = 0; i < g_nup_decs; i++) {
+            up_dec *x = &g_up_decs[i];
+            [g_up_ct setAddress:x->stg.gpuAddress atIndex:0];
+            [g_up_ct setAddress:x->params.gpuAddress + x->poff atIndex:1];
+            [g_up_ct setAddress:x->stg.gpuAddress atIndex:2];
+            [b dispatchThreadgroups:MTLSizeMake((x->bw + 7) / 8, (x->bh + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        }
+        [b barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageAll visibilityOptions:resource_vis()];
+    }
     for (int i = 0; b && i < g_nup_blits; i++) {
         up_blit *x = &g_up_blits[i];
         enc_b_copy_buffer_texture(b, x->src, x->off, x->row, x->image, x->size, x->dst, x->slice, x->level, MTLOriginMake(0, 0, 0));
@@ -2075,7 +2250,7 @@ static void up_flush(void) {
     if (up_reuse()) g_up_slot_want[slot] = MAX(g_up_slot_want[slot], g_up_batch_bytes);
     g_up_cb = nil;
     up_diag();
-    g_nup_blits = 0;
+    g_nup_blits = 0; g_nup_decs = 0;
     [g_up_texs removeAllObjects];
 }
 
@@ -2142,7 +2317,7 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
         // The old block and the "current block" retired at flush are two objects, so nothing is retired twice
         if (g_up_block) { g_up_swaps++; g_up_swap_bytes += g_up_block_size; if (!up_retained(g_up_block, g_up_cur_slot)) { @autoreleasepool { if (!g_up_old) g_up_old = [NSHashTable weakObjectsHashTable]; [g_up_old addObject:g_up_block]; } } static int leak = -1; if (leak < 0) leak = getenv("DM_TEST_UP_LEAK") != NULL;
             if (!leak && !up_retained(g_up_block, g_up_cur_slot)) { if (!g_up_keep) g_up_keep = [NSMutableArray array]; [g_up_keep addObject:g_up_block]; } }
-        if (up_reuse() && need <= UP_BLOCK_SIZE && !g_up_over_used) {
+        if (up_reuse() && !low_mem_device() && need <= UP_BLOCK_SIZE && !g_up_over_used) {
             __strong id<MTLBuffer> *sb = &g_up_slot_over[g_up_cur_slot];
             if (!*sb) { *sb = [g_dev newBufferWithLength:UP_BLOCK_SIZE options:MTLResourceStorageModePrivate]; if (!*sb) MDIE("failed to create the overflow staging block"); res_add(*sb); g_up_blocks_new++; }
             g_up_block = *sb; g_up_block_size = (*sb).length; g_up_over_used = 1;
@@ -2261,16 +2436,22 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         *stamp = nvn_dirty_now();
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size); }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint32_t upf = 0; int ubw = bw, ubh = bh, ubpb = bpb;
+    int unp = bc_target_fmt(t->d.format, t->d.target, &upf, &ubw, &ubh, &ubpb);
+    if (unp) direct = 0;   // direct RGBA16Uint texture writes do not apply to BC-transcoded textures
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
-    size_t total = 0;
+    size_t total = 0, ctotal = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
-        total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
+        total += (size_t)((w + ubw - 1) / ubw) * ubpb * ((h + ubh - 1) / ubh) * z * layers;
+        ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * layers;
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int use_gpu = !rb_shift && !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
-    if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
+    int bfmt = unp ? bcd_fmt(t->d.format, t->d.target) : 0;
+    int gdec = unp && bfmt && bcd_pso();
+    int use_gpu = (!unp || gdec) && !rb_shift && !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
+    if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift && !unp) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
@@ -2290,17 +2471,31 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 [g_up_ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
             }
         }
+        size_t total_al = (total + 15u) & ~((size_t)15u), ctotal_al = (ctotal + 15u) & ~((size_t)15u);
+        size_t stg_need = gdec ? (total_al + ctotal_al) : (total ? total : 16);
         size_t stg_off;
-        id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
-        size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
+        id<MTLBuffer> stg = up_alloc(stg_need ? stg_need : 16, &stg_off);
+        size_t off = 0, coff = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits, nd0 = g_nup_decs;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
+            size_t dpitch = (size_t)((w + ubw - 1) / ubw) * ubpb, drows = (h + ubh - 1) / ubh;
             for (unsigned y = 0; y < layers; y++) {
                 size_t poff; id<MTLBuffer> params = up_param_alloc(&poff);   // Metal 4 has no setBytes: the parameter block of each deswizzle is cut from a shared block (no new GPU buffer each time)
-                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
-                up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
-                off += pitch * rows * z;
+                size_t deswz_dst = gdec ? (stg_off + total_al + coff) : (stg_off + off);
+                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, deswz_dst, pitch)) { enc_ok = 0; break; }
+                if (gdec) {
+                    size_t qoff; id<MTLBuffer> q = up_param_alloc(&qoff);
+                    if (!q) { enc_ok = 0; break; }
+                    uint32_t *pp = (uint32_t *)((uint8_t *)q.contents + qoff);
+                    pp[0] = (uint32_t)deswz_dst; pp[1] = (uint32_t)pitch; pp[2] = w; pp[3] = h;
+                    pp[4] = (uint32_t)bfmt; pp[5] = (uint32_t)(stg_off + off); pp[6] = (uint32_t)dpitch; pp[7] = 0;
+                    if (g_nup_decs == g_up_deccap) { g_up_deccap = g_up_deccap ? g_up_deccap * 2 : 256; g_up_decs = realloc(g_up_decs, g_up_deccap * sizeof *g_up_decs); }
+                    g_up_decs[g_nup_decs++] = (up_dec){stg, q, qoff, (w + 3) / 4, (h + 3) / 4};
+                }
+                up_blit_add(stg, stg_off + off, dpitch, dpitch * drows, MTLSizeMake(w, h, z), mt, y, l);
+                off += dpitch * drows * z;
+                coff += pitch * rows * z;
             }
         }
         if (enc_ok) {
@@ -2308,7 +2503,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
             if (!g_cb) up_flush();
             return mt;
         }
-        g_nup_blits = nb0;   // Roll back the copies already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
+        g_nup_blits = nb0; g_nup_decs = nd0;   // Roll back the copies / transcodes already recorded for this texture; this texture takes the CPU path below instead
         if (!g_cb) up_flush();
         RED_ONCE(41, "GPU deswizzle does not support format %#x target %d; falling back to the CPU", t->d.format, t->d.target);
     }
@@ -2328,6 +2523,17 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
+            if (unp) {
+                uint8_t *cb = malloc(pitch * rows * z);
+                size_t dpitch = (size_t)((w + ubw - 1) / ubw) * ubpb, drows = (h + ubh - 1) / ubh;
+                if (!cb || nvn_deswizzle(&t->d, l, y, src, cb, pitch)) { free(cb); RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+                for (uint32_t zi = 0; zi < z; zi++)
+                    nvn_bc_decode_target(t->d.format, t->d.target, cb + zi * pitch * rows, pitch, w, h, (uint8_t *)stg.contents + off + zi * dpitch * drows, dpitch);
+                free(cb);
+                up_blit_add(stg, off, dpitch, dpitch * drows, MTLSizeMake(w, h, z), mt, y, l);
+                off += dpitch * drows * z;
+                continue;
+            }
             if (nvn_deswizzle(&t->d, l, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
             if (rb_shift) rb_swap_rows((uint8_t *)stg.contents + off, pitch, rows, z, pitch, pitch * rows, rb_shift);
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
@@ -3326,11 +3532,16 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
     id<MTLTexture> base = tex_mtl(t);
     // A texture made without render-target use (packaged or CPU-written, uploaded from its storage) drawn into: give it that use, as a clear of one does (clear_tex). Metal's validation
     // stops at such an attachment; without it Tears of the Kingdom drew its terrain normal maps into textures made for reading only
-    if (base && !(base.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(base.pixelFormat) && base.sampleCount == 1) base = tex_upgrade(t, base, MTLTextureUsageRenderTarget, base.pixelFormat);
+    if (base && !(base.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(base.pixelFormat) && !(no_bc() && nvn_fmt_bc(t->d.format)) && base.sampleCount == 1) base = tex_upgrade(t, base, MTLTextureUsageRenderTarget, base.pixelFormat);
     a.texture = base;
     if (has_v && v->set_levels) a.level = v->base_level;
     if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
     if (base && mtl_fmt_block(base.pixelFormat)) { if (!bcrt_attach(a, base, v, has_v)) { rt_view_fmt(base, v, has_v); a.texture = nil; } return; }   // compressed formats: a shadow or nothing (see rt_view_fmt)
+    if (base && nvn_fmt_bc(t->d.format)) {   // No-BC GPU: BC texture stored in R8 / RG8 / RG11B10F / RGBA8 cannot be attached through a raw-block view (GitHub issue #4)
+        RED_ONCE(78, "render target is a BC texture on a non-BC GPU (Metal format %lu %lux%lu, view format change %d -> NVN %#x): not attached",
+                 (unsigned long)base.pixelFormat, (unsigned long)base.width, (unsigned long)base.height, has_v ? v->set_format : 0, has_v ? v->format : 0);
+        a.texture = nil; return;
+    }
     if (base && mtl_fmt_depth(base.pixelFormat) && bcrt_attach(a, base, v, has_v)) return;   // a depth texture through a colour view: a shadow (see shrt_block)
     // A view that changes the format is attached as a Metal view of that format (pipeline formats follow the attachment). SMBW's last pass writes the RGBA8 swapchain texture through an RGBA8_SRGB view, so the hardware encodes sRGB on write;
     // attaching the base texture instead stored the linear values as they were and the whole picture came out dark (every value decoded from sRGB once more, on the Mac and the iPhone). The view lives until this submission completes
@@ -4317,6 +4528,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         if (!r.has_v) memset(&r.v, 0, sizeof r.v);
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
+        { uint32_t upf = 0; int ubw = 1, ubh = 1, ubpb = 0; if (r.v.set_format && bc_target_fmt(r.v.format, rp->t.d.target, &upf, &ubw, &ubh, &ubpb)) pf = upf; }
         if (stv) pf = MTLPixelFormatX32_Stencil8;
         if (r.v.set_format && nvn_fmt_bc(rp->t.d.format) && !nvn_fmt_bc(r.v.format)) {   // the raw blocks of a BC texture through an uncompressed view (see rt_view_fmt): Metal has no such view
             RED_ONCE(86, "Metal cannot create the raw-block view of a compressed texture (NVN format %#x → view %#x): treated as an empty slot", rp->t.d.format, r.v.format);
@@ -9791,7 +10003,7 @@ static size_t mtl_pf_block_bytes(MTLPixelFormat pf) {   // bytes per texel, or p
 }
 static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, unsigned layer0, const NVNcopyRegion *r, const char *from, int absorb) {   // absorb: a render pass's readback, which the texture takes as its own (pkg_absorb_note)
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh), nz = r->depth ? r->depth : 1;
-    if (!bpb || r->width <= 0 || r->height <= 0 || d.sampleCount > 1 || mtl_fmt_depth(d.pixelFormat) || d.pixelFormat == MTLPixelFormatStencil8 || mtl_pf_block_bytes(d.pixelFormat) != (size_t)bpb) { mirror_note(-1, t, level, from, 1); return; }
+    if (!bpb || (no_bc() && nvn_fmt_bc(t->d.format)) || r->width <= 0 || r->height <= 0 || d.sampleCount > 1 || mtl_fmt_depth(d.pixelFormat) || d.pixelFormat == MTLPixelFormatStencil8 || mtl_pf_block_bytes(d.pixelFormat) != (size_t)bpb) { mirror_note(-1, t, level, from, 1); return; }
     size_t row = (size_t)((r->width + bw - 1) / bw) * bpb, img = row * (size_t)((r->height + bh - 1) / bh);
     id<MTLBuffer> b = [g_dev newBufferWithLength:img * nz options:MTLResourceStorageModeShared];
     if (!b) { mirror_note(-1, t, level, from, 1); return; }
@@ -9838,6 +10050,23 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (is3d && passdump()) { const char *dd = getenv("DM_NVN_CBDUMP"); if (dd) {   // the source bytes of a 3D upload, beside the uniform dumps (F<frame>_c3d_<serial>.bin)
         char p[1024]; snprintf(p, sizeof p, "%s/F%llu_c3d_%llu.bin", dd, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial);
         FILE *f = fopen(p, "wb"); if (f) { fwrite((const uint8_t *)((__bridge id<MTLBuffer>)mb).contents + mo, 1, img * nz, f); fclose(f); } } }
+    uint32_t upf = 0; int ubw = 1, ubh = 1, ubpb = 0;
+    if (bc_target_fmt(c->tex->d.format, c->tex->d.target, &upf, &ubw, &ubh, &ubpb)) {
+        const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents];
+        if (!src) { RED_ONCE(46, "no-BC buffer->texture copy source buffer is not CPU-readable"); return; }
+        size_t dpitch = (size_t)((c->r.width + ubw - 1) / ubw) * ubpb;
+        size_t drows = (c->r.height + ubh - 1) / ubh, dimg = dpitch * drows;
+        id<MTLBuffer> tb = [g_dev newBufferWithLength:(dimg * nz) ? (dimg * nz) : 16 options:MTLResourceStorageModeShared];
+        if (!tb) return;
+        for (int z = 0; z < nz; z++)
+            nvn_bc_decode_target(c->tex->d.format, c->tex->d.target, src + mo + z * img, row, c->r.width, c->r.height, (uint8_t *)tb.contents + z * dimg, dpitch);
+        res_add(tb);
+        id<MTL4ComputeCommandEncoder> b = blit();
+        if (is3d) enc_b_copy_buffer_texture(b, tb, 0, dpitch, dimg, MTLSizeMake(c->r.width, c->r.height, nz), t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset));
+        else for (int z = 0; z < nz; z++) enc_b_copy_buffer_texture(b, tb, z * dimg, dpitch, dimg, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
+        defer_obj_release(tb);
+        return;
+    }
     // Into Metal's order (rb_copy_shift): converted on the GPU into a staging area of the frame arena, which the blit copies from
     id<MTLBuffer> sb = (__bridge id<MTLBuffer>)mb; int shift = rb_copy_shift(c->tex, t);
     if (shift) {
@@ -11699,5 +11928,42 @@ void mtl_wait_state_dump(void) {
          (unsigned long long)g_pq_in, (unsigned long long)g_pq_done, g_cb != nil, atomic_load(&g_sub_thread_set));
 }
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
+void mtl_trim_memory(int urgent) {
+    defer_drain();
+    pthread_mutex_lock(&g_smu);
+    uint32_t evicted = 0;
+    if (urgent) {
+        for (unsigned i = 0; i < NGHOST; i++) {
+            uint64_t k = g_ghost_ring[i];
+            if (!k) continue;
+            id ev = hm_get_id(&g_ghost, &k);
+            if (ev) obj_drop(ev);
+            hm_del_id(&g_ghost, &k);
+            g_ghost_ring[i] = 0;
+            evicted++;
+        }
+    }
+    uint64_t cur_fence = g_fence + 1;
+    uint64_t idle_thresh = urgent ? 2 : alias_idle_limit();
+    for (uint32_t i = 0; i < g_alias.cap; i++) {
+        if (!g_alias.vals[i]) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+        id o = (__bridge id)g_alias.vals[i];
+        if ((seen && cur_fence - seen < idle_thresh) || serial_holds(&g_by_serial, o) || serial_holds(&g_ghost, o)) continue;
+        void *old = nvn_hm_del(&g_alias, &k);
+        if (old) {
+            nvn_hm_del(&g_alias_seen, &k);
+            id rel = CFBridgingRelease(old);
+            if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)rel);
+            defer_obj_release(rel);
+            evicted++;
+        }
+    }
+    if (evicted) g_ser_gen++;
+    pthread_mutex_unlock(&g_smu);
+    MLOG("mtl_trim_memory(urgent=%d): evicted %u cached texture entries (available memory %llu MB)",
+         urgent, evicted, (unsigned long long)(avail_mem_bytes() >> 20));
+}
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop

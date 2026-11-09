@@ -31,4 +31,5 @@ DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+DM_BC_ASTC	toggle	-	1	gfxapi:nvn	Performance	BC to ASTC 4x4	Transcodes 2D BC textures to ASTC 4x4 on GPUs without hardware BC (saves 75% texture memory vs RGBA8).
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD

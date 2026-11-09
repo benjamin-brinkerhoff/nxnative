@@ -16,6 +16,7 @@
 #define VK_NO_PROTOTYPES
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
+#include "../tex/nvn_bcdec.h"
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_vi.h>
 #import <Metal/Metal.h>
@@ -111,6 +112,24 @@ static const fmt_t *fmt_of(VkFormat f) {
 }
 static int fmt_has_depth(const fmt_t *f) { return f && (f->kind == K_DEPTH || f->kind == K_DS); }
 static int fmt_has_stencil(const fmt_t *f) { return f && (f->kind == K_STENCIL || f->kind == K_DS); }
+static uint32_t vk_fmt_nvn_bc(VkFormat vk) {
+    switch (vk) {
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return 0x41; case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return 0x42;
+        case VK_FORMAT_BC2_UNORM_BLOCK: return 0x43; case VK_FORMAT_BC3_UNORM_BLOCK: return 0x44;
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return 0x45; case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 0x46;
+        case VK_FORMAT_BC2_SRGB_BLOCK: return 0x47; case VK_FORMAT_BC3_SRGB_BLOCK: return 0x48;
+        case VK_FORMAT_BC4_UNORM_BLOCK: return 0x49; case VK_FORMAT_BC4_SNORM_BLOCK: return 0x4a;
+        case VK_FORMAT_BC5_UNORM_BLOCK: return 0x4b; case VK_FORMAT_BC5_SNORM_BLOCK: return 0x4c;
+        case VK_FORMAT_BC7_UNORM_BLOCK: return 0x4d; case VK_FORMAT_BC7_SRGB_BLOCK: return 0x4e;
+        case VK_FORMAT_BC6H_SFLOAT_BLOCK: return 0x4f; case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 0x50;
+        default: return 0;
+    }
+}
+static int vk_no_bc(id<MTLDevice> dev) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_TEST_NO_BC"); v = (e && *e && strcmp(e, "0")) || ![dev supportsBCTextureCompression]; }
+    return v;
+}
 
 // ---------- Device-wide state ----------
 static id<MTLDevice> g_dev;
@@ -495,7 +514,9 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         uint32_t layers = umax(1, ci->arrayLayers), samples = umax(1, ci->samples);
         int cube = (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers % 6 == 0;
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
-        td.pixelFormat = f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
+        uint32_t upf = (uint32_t)f->pf; int ubw = 1, ubh = 1, ubpb = 0;
+        if (vk_no_bc(g_dev) && vk_fmt_nvn_bc(ci->format)) nvn_bc_target_fmt(vk_fmt_nvn_bc(ci->format), ci->imageType == VK_IMAGE_TYPE_3D ? 2 : 1, &upf, &ubw, &ubh, &ubpb);
+        td.pixelFormat = (MTLPixelFormat)upf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
         td.mipmapLevelCount = umax(1, ci->mipLevels); td.sampleCount = samples;
         if (ci->imageType == VK_IMAGE_TYPE_3D) td.textureType = MTLTextureType3D;
         else if (ci->imageType == VK_IMAGE_TYPE_1D) td.textureType = layers > 1 ? MTLTextureType1DArray : MTLTextureType1D;
@@ -567,6 +588,7 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     (void)d; (void)a;
     VkImage im = ci->image; const fmt_t *f = fmt_of(ci->format);
     MTLPixelFormat pf = f && f->pf != MTLPixelFormatInvalid ? f->pf : im->f->pf;
+    { uint32_t upf = 0; int ubw = 1, ubh = 1, ubpb = 0; if (vk_no_bc(g_dev) && vk_fmt_nvn_bc(ci->format) && nvn_bc_target_fmt(vk_fmt_nvn_bc(ci->format), im->type == VK_IMAGE_TYPE_3D ? 2 : 1, &upf, &ubw, &ubh, &ubpb)) pf = (MTLPixelFormat)upf; }
     const VkImageSubresourceRange *r = &ci->subresourceRange;
     if (r->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT && pf == MTLPixelFormatDepth32Float_Stencil8) pf = MTLPixelFormatX32_Stencil8;
     uint32_t lv = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
@@ -1278,6 +1300,27 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
                     NSUInteger bpr = (NSUInteger)((rl + f->bw - 1) / f->bw) * f->bytes, bpi = bpr * ((ih + f->bh - 1) / f->bh);
                     int is3d = im->type == VK_IMAGE_TYPE_3D;
                     MTLBlitOption opt = f->kind == K_DS ? (r->imageSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil) : MTLBlitOptionNone;
+                    uint32_t nvn_f = vk_no_bc(g_dev) ? vk_fmt_nvn_bc(im->fmt) : 0, upf = 0; int ubw = 1, ubh = 1, ubpb = 0;
+                    if (nvn_f && nvn_bc_target_fmt(nvn_f, is3d ? 2 : 1, &upf, &ubw, &ubh, &ubpb)) {
+                        NSUInteger dpitch = (NSUInteger)((r->imageExtent.width + (uint32_t)ubw - 1) / (uint32_t)ubw) * (NSUInteger)ubpb;
+                        NSUInteger drows = (r->imageExtent.height + (uint32_t)ubh - 1) / (uint32_t)ubh, dimg = dpitch * drows;
+                        uint32_t nlayers = is3d ? r->imageExtent.depth : r->imageSubresource.layerCount;
+                        id<MTLBuffer> tb = [g_dev newBufferWithLength:(dimg * nlayers) ? (dimg * nlayers) : 16 options:MTLResourceStorageModeShared];
+                        const uint8_t *sptr = (const uint8_t *)sb.contents + x->src->off + r->bufferOffset;
+                        for (uint32_t l = 0; l < nlayers; l++)
+                            nvn_bc_decode_target(nvn_f, is3d ? 2 : 1, sptr + l * bpi, bpr, r->imageExtent.width, r->imageExtent.height, (uint8_t *)tb.contents + l * dimg, dpitch);
+                        if (is3d)
+                            [be copyFromBuffer:tb sourceOffset:0 sourceBytesPerRow:dpitch sourceBytesPerImage:dimg
+                                    sourceSize:MTLSizeMake(r->imageExtent.width, r->imageExtent.height, r->imageExtent.depth) toTexture:im->tex
+                              destinationSlice:0 destinationLevel:r->imageSubresource.mipLevel
+                             destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, r->imageOffset.z) options:opt];
+                        else for (uint32_t l = 0; l < nlayers; l++)
+                            [be copyFromBuffer:tb sourceOffset:l * dimg sourceBytesPerRow:dpitch sourceBytesPerImage:dimg
+                                    sourceSize:MTLSizeMake(r->imageExtent.width, r->imageExtent.height, 1) toTexture:im->tex
+                              destinationSlice:r->imageSubresource.baseArrayLayer + l destinationLevel:r->imageSubresource.mipLevel
+                             destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, 0) options:opt];
+                        continue;
+                    }
                     for (uint32_t l = 0; l < (is3d ? 1 : r->imageSubresource.layerCount); l++)
                         [be copyFromBuffer:sb sourceOffset:x->src->off + r->bufferOffset + l * bpi sourceBytesPerRow:bpr sourceBytesPerImage:is3d || im->layers > 1 ? bpi : 0
                                 sourceSize:MTLSizeMake(r->imageExtent.width, r->imageExtent.height, is3d ? r->imageExtent.depth : 1) toTexture:im->tex
